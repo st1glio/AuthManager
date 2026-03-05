@@ -9,7 +9,7 @@
 ## Steps
 
 1. Download and install `PacketEvents` in your server `plugins/` folder.
-2. Download `AuthManager-BETA-1.3.jar`.
+2. Download `AuthManager-BETA-1.4.jar`.
 3. Place the jar in `plugins/`.
 4. Start server once to generate default config files.
 5. Configure `plugins/AuthManager/config.yml`.

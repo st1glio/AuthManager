@@ -5,7 +5,7 @@
 
     <groupId>me.stiglio</groupId>
     <artifactId>AuthManager</artifactId>
-    <version>BETA-1.3</version>
+    <version>BETA-1.4</version>
     <packaging>jar</packaging>
 
     <name>AuthManager</name>
@@ -19,6 +19,10 @@
         <paper-api.version>1.21.11-R0.1-SNAPSHOT</paper-api.version>
         <packetevents.version>2.11.2</packetevents.version>
         <sqlite.version>3.50.3.0</sqlite.version>
+        <mysql.version>8.4.0</mysql.version>
+        <postgresql.version>42.7.4</postgresql.version>
+        <hikari.version>5.1.0</hikari.version>
+        <testcontainers.version>1.20.4</testcontainers.version>
     </properties>
 
     <repositories>
@@ -62,6 +66,27 @@
         </dependency>
 
         <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <version>${mysql.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>${postgresql.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>com.zaxxer</groupId>
+            <artifactId>HikariCP</artifactId>
+            <version>${hikari.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
             <groupId>com.google.code.gson</groupId>
             <artifactId>gson</artifactId>
             <version>2.13.2</version>
@@ -79,6 +104,27 @@
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
             <version>5.11.4</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>mysql</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>${testcontainers.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>

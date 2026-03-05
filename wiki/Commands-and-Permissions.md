@@ -20,7 +20,6 @@ Aliases:
 
 ## Admin Commands
 
-- `/lookup <player|ip>`
 - `/authadmin <subcommand>`
 
 Authadmin subcommands:
@@ -28,6 +27,8 @@ Authadmin subcommands:
 - `help`
 - `status`
 - `stats`
+- `db`
+- `lookup`
 - `reload`
 - `ratelimit`
 - `sessions`
@@ -50,10 +51,8 @@ Aliases:
 
 Required for:
 
-- `/authadmin`
-- `/lookup`
+- `/authadmin` and all its subcommands
 
 Current behavior:
 
 - `/premium` and `/unpremium` do not require a dedicated premium permission.
-

@@ -2,6 +2,7 @@ package me.stiglio.authManager.commands;
 
 import me.stiglio.authManager.AuthManager;
 import me.stiglio.authManager.config.ConfigManager;
+import me.stiglio.authManager.database.DatabaseManager;
 import me.stiglio.authManager.service.AuthService;
 import me.stiglio.authManager.service.OperationResult;
 import me.stiglio.authManager.utils.MessageUtils;
@@ -18,6 +19,9 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
     private static final String DARK_GRAY = "\u00A78";
@@ -27,12 +31,15 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
     private static final String GRAY = "\u00A77";
     private static final String WHITE = "\u00A7f";
     private static final String GREEN = "\u00A7a";
+    private static final long IMPORT_CONFIRM_TTL_MILLIS = 120_000L;
+
     private static final DateTimeFormatter DATE_TIME_FORMATTER =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss").withZone(ZoneId.systemDefault());
 
     private final AuthManager plugin;
     private final AuthService authService;
     private final ConfigManager configManager;
+    private final Map<String, PendingImportRequest> pendingImports = new ConcurrentHashMap<>();
 
     public AuthAdminCommand(AuthManager plugin, AuthService authService, ConfigManager configManager) {
         this.plugin = plugin;
@@ -64,6 +71,14 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
             }
             case "stats" -> {
                 handleStats(sender, args);
+                yield true;
+            }
+            case "db" -> {
+                handleDb(sender, args);
+                yield true;
+            }
+            case "lookup" -> {
+                handleLookup(sender, args);
                 yield true;
             }
             case "reload" -> {
@@ -107,7 +122,7 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
                 yield true;
             }
             default -> {
-                sendLine(sender, RED + "Sottocomando sconosciuto. Usa /" + label + " help");
+                sendLine(sender, RED + "Unknown subcommand. Use /" + label + " help");
                 yield true;
             }
         };
@@ -121,8 +136,8 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
 
         if (args.length == 1) {
             return filterPrefix(args[0], List.of(
-                    "help", "status", "stats", "reload", "ratelimit", "sessions", "unlock", "setpassword",
-                    "forceauth", "forceunauth", "kickunauth", "packet", "player"
+                    "help", "status", "stats", "db", "lookup", "reload", "ratelimit", "sessions", "unlock",
+                    "setpassword", "forceauth", "forceunauth", "kickunauth", "packet", "player"
             ));
         }
 
@@ -131,7 +146,15 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
             return filterPrefix(args[1], List.of("status", "clear"));
         }
 
-        if (("forceauth".equals(sub) || "forceunauth".equals(sub)
+        if ("db".equals(sub) && args.length == 2) {
+            return filterPrefix(args[1], List.of("status", "health", "migrations", "import"));
+        }
+
+        if ("db".equals(sub) && args.length == 3 && "import".equalsIgnoreCase(args[1])) {
+            return filterPrefix(args[2], List.of("confirm", "cancel", "authmanager.sqlite"));
+        }
+
+        if (("lookup".equals(sub) || "forceauth".equals(sub) || "forceunauth".equals(sub)
                 || "player".equals(sub) || "unlock".equals(sub) || "setpassword".equals(sub))
                 && args.length == 2) {
             return onlinePlayerNames(args[1]);
@@ -149,43 +172,85 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
     }
 
     private void sendHelp(CommandSender sender) {
-        sendLine(sender, YELLOW + "Comandi admin disponibili:");
+        sendLine(sender, YELLOW + "Available AuthAdmin commands:");
         sendLine(sender, GRAY + "/authadmin status");
-        sendLine(sender, GRAY + "/authadmin stats [giorni_attivi]");
+        sendLine(sender, GRAY + "/authadmin stats [active_days]");
+        sendLine(sender, GRAY + "/authadmin db <status|health|migrations|import>");
+        sendLine(sender, GRAY + "/authadmin lookup <player|ip>");
         sendLine(sender, GRAY + "/authadmin reload");
-        sendLine(sender, GRAY + "/authadmin ratelimit status");
-        sendLine(sender, GRAY + "/authadmin ratelimit clear");
+        sendLine(sender, GRAY + "/authadmin ratelimit <status|clear>");
         sendLine(sender, GRAY + "/authadmin sessions");
         sendLine(sender, GRAY + "/authadmin unlock <player>");
-        sendLine(sender, GRAY + "/authadmin setpassword <player> <nuovaPassword>");
+        sendLine(sender, GRAY + "/authadmin setpassword <player> <newPassword>");
         sendLine(sender, GRAY + "/authadmin forceauth <player>");
         sendLine(sender, GRAY + "/authadmin forceunauth <player>");
-        sendLine(sender, GRAY + "/authadmin kickunauth [messaggio]");
+        sendLine(sender, GRAY + "/authadmin kickunauth [message]");
         sendLine(sender, GRAY + "/authadmin packet clear <player>");
         sendLine(sender, GRAY + "/authadmin player <name>");
-        sendLine(sender, GRAY + "/lookup <player|ip>");
     }
 
     private void handleStatus(CommandSender sender) {
-        AuthService.AdminStatusSnapshot snapshot = authService.snapshotStatus();
-        sendLine(sender, YELLOW + "Status AuthManager:");
-        sendLine(sender, GRAY + "online-mode=" + WHITE + snapshot.serverOnlineMode()
-                + GRAY + " premium-protection=" + WHITE + snapshot.premiumNameProtectionEnabled());
-        sendLine(sender, GRAY + "verification-mode=" + WHITE + snapshot.premiumVerificationMode()
-                + GRAY + " trusted-proxy=" + WHITE + snapshot.trustedProxyPremiumIdentity());
-        sendLine(sender, GRAY + "startup-fail-fast=" + WHITE + snapshot.startupFailFast());
-        sendLine(sender, GRAY + "rate-limit=" + WHITE + snapshot.rateLimitEnabled()
-                + GRAY + " pre-login=" + WHITE + snapshot.preLoginRateLimitEnabled());
-        sendLine(sender, GRAY + "online=" + WHITE + snapshot.onlinePlayers()
-                + GRAY + " unauth=" + WHITE + snapshot.unauthenticatedOnline());
-        sendLine(sender, GRAY + "rl-login=" + WHITE + snapshot.loginRateLimitEntries()
-                + GRAY + " rl-register=" + WHITE + snapshot.registerRateLimitEntries()
-                + GRAY + " rl-prelogin=" + WHITE + snapshot.preLoginRateLimitEntries());
-        sendLine(sender, GRAY + "account-lock=" + WHITE + snapshot.accountLockEntries()
-                + GRAY + " remembered-sessions=" + WHITE + snapshot.rememberedSessionEntries());
-        sendLine(sender, GRAY + "tracked-auth=" + WHITE + snapshot.authenticatedTracked()
-                + GRAY + " tracked-pending=" + WHITE + snapshot.pendingTracked()
-                + GRAY + " tracked-packet=" + WHITE + snapshot.packetIdentityTracked());
+        sendLine(sender, YELLOW + "Collecting status snapshot...");
+        authService.fetchDetailedStatusAsync(snapshot -> {
+            AuthService.AdminStatusSnapshot runtime = snapshot.runtime();
+            DatabaseManager.DatabaseHealthSnapshot dbHealth = snapshot.databaseHealth();
+            DatabaseManager.DatabaseRuntimeSnapshot dbRuntime = runtime.databaseRuntime();
+            DatabaseManager.QueryMetricsSnapshot dbQuery = dbRuntime.queryMetrics();
+            DatabaseManager.MigrationSnapshot migrations = dbRuntime.migrations();
+            AuthService.MetricsSnapshot login = runtime.loginMetrics();
+            AuthService.MetricsSnapshot register = runtime.registerMetrics();
+            AuthService.MetricsSnapshot preLogin = runtime.preLoginMetrics();
+            AuthService.OnlineUserCacheSnapshot cache = runtime.onlineUserCache();
+
+            sendLine(sender, YELLOW + "AuthManager status:");
+            sendLine(sender, GRAY + "uptime=" + WHITE + runtime.uptimeSeconds() + "s"
+                    + GRAY + " online-mode=" + WHITE + runtime.serverOnlineMode()
+                    + GRAY + " startup-fail-fast=" + WHITE + runtime.startupFailFast());
+            sendLine(sender, GRAY + "premium-protection=" + WHITE + runtime.premiumNameProtectionEnabled()
+                    + GRAY + " verification=" + WHITE + runtime.premiumVerificationMode()
+                    + GRAY + " trusted-proxy=" + WHITE + runtime.trustedProxyPremiumIdentity());
+            sendLine(sender, GRAY + "online=" + WHITE + runtime.onlinePlayers()
+                    + GRAY + " unauth=" + WHITE + runtime.unauthenticatedOnline()
+                    + GRAY + " tracked-auth=" + WHITE + runtime.authenticatedTracked()
+                    + GRAY + " tracked-pending=" + WHITE + runtime.pendingTracked());
+            sendLine(sender, GRAY + "rate-limit enabled=" + WHITE + runtime.rateLimitEnabled()
+                    + GRAY + " pre-login=" + WHITE + runtime.preLoginRateLimitEnabled()
+                    + GRAY + " rl(login/register/prelogin)=" + WHITE
+                    + runtime.loginRateLimitEntries() + "/"
+                    + runtime.registerRateLimitEntries() + "/"
+                    + runtime.preLoginRateLimitEntries());
+            sendLine(sender, GRAY + "locks=" + WHITE + runtime.accountLockEntries()
+                    + GRAY + " remembered-sessions=" + WHITE + runtime.rememberedSessionEntries()
+                    + GRAY + " packet-identities=" + WHITE + runtime.packetIdentityTracked());
+            sendLine(sender, GRAY + "avg-ms login=" + WHITE + formatDouble(login.averageMillis())
+                    + GRAY + " register=" + WHITE + formatDouble(register.averageMillis())
+                    + GRAY + " prelogin=" + WHITE + formatDouble(preLogin.averageMillis()));
+            sendLine(sender, GRAY + "calls login=" + WHITE + login.totalCalls() + "(" + login.successfulCalls() + "/" + login.failedCalls() + ")"
+                    + GRAY + " register=" + WHITE + register.totalCalls() + "(" + register.successfulCalls() + "/" + register.failedCalls() + ")");
+            sendLine(sender, GRAY + "db type=" + WHITE + dbRuntime.type()
+                    + GRAY + " health=" + WHITE + dbHealth.healthy()
+                    + GRAY + " ping=" + WHITE + dbHealth.pingMillis() + "ms"
+                    + GRAY + " note=" + WHITE + blankDash(dbHealth.note()));
+            sendLine(sender, GRAY + "db pool active/idle/total/waiting=" + WHITE
+                    + dbRuntime.activeConnections() + "/"
+                    + dbRuntime.idleConnections() + "/"
+                    + dbRuntime.totalConnections() + "/"
+                    + dbRuntime.threadsAwaitingConnection());
+            sendLine(sender, GRAY + "db queries total=" + WHITE + dbQuery.totalQueries()
+                    + GRAY + " failed=" + WHITE + dbQuery.failedQueries()
+                    + GRAY + " retries=" + WHITE + dbQuery.retriedQueries()
+                    + GRAY + " avg-ms=" + WHITE + formatDouble(dbQuery.averageQueryMillis()));
+            sendLine(sender, GRAY + "db migrations current/latest=" + WHITE + migrations.currentVersion() + "/" + migrations.latestVersion()
+                    + GRAY + " pending=" + WHITE + migrations.pendingVersions().size());
+            sendLine(sender, GRAY + "cache entries=" + WHITE + cache.entries()
+                    + GRAY + " hits=" + WHITE + cache.hits()
+                    + GRAY + " misses=" + WHITE + cache.misses()
+                    + GRAY + " hit-rate=" + WHITE + formatDouble(cache.hitRatePercent()) + "%");
+            sendLine(sender, GRAY + "executor pool/active/queued=" + WHITE
+                    + runtime.authExecutorPoolSize() + "/"
+                    + runtime.authExecutorActiveThreads() + "/"
+                    + runtime.authExecutorQueuedTasks());
+        });
     }
 
     private void handleStats(CommandSender sender, String[] args) {
@@ -194,7 +259,7 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
             try {
                 activeWindowDays = Math.max(1, Integer.parseInt(args[1]));
             } catch (NumberFormatException exception) {
-                sendLine(sender, RED + "Uso: /authadmin stats [giorni_attivi]");
+                sendLine(sender, RED + "Usage: /authadmin stats [active_days]");
                 return;
             }
         }
@@ -202,16 +267,154 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
         final int requestedWindowDays = activeWindowDays;
         AuthService.AdminStatusSnapshot runtime = authService.snapshotStatus();
         authService.fetchUserStatisticsAsync(requestedWindowDays, db -> {
-            sendLine(sender, YELLOW + "Statistiche account (" + requestedWindowDays + " giorni):");
-            sendLine(sender, GRAY + "totali=" + WHITE + db.totalUsers()
+            sendLine(sender, YELLOW + "Account stats (" + requestedWindowDays + " days):");
+            sendLine(sender, GRAY + "total=" + WHITE + db.totalUsers()
                     + GRAY + " premium=" + WHITE + db.premiumUsers());
-            sendLine(sender, GRAY + "attivi=" + WHITE + db.activeUsers()
-                    + GRAY + " inattivi=" + WHITE + db.inactiveUsers());
+            sendLine(sender, GRAY + "active=" + WHITE + db.activeUsers()
+                    + GRAY + " inactive=" + WHITE + db.inactiveUsers());
             sendLine(sender, GRAY + "online=" + WHITE + runtime.onlinePlayers()
-                    + GRAY + " autenticati=" + WHITE + runtime.authenticatedTracked()
-                    + GRAY + " in-attesa=" + WHITE + runtime.unauthenticatedOnline());
-            sendLine(sender, GRAY + "locks-account=" + WHITE + runtime.accountLockEntries()
+                    + GRAY + " authenticated=" + WHITE + runtime.authenticatedTracked()
+                    + GRAY + " pending=" + WHITE + runtime.unauthenticatedOnline());
+            sendLine(sender, GRAY + "account-locks=" + WHITE + runtime.accountLockEntries()
                     + GRAY + " remembered-sessions=" + WHITE + runtime.rememberedSessionEntries());
+        });
+    }
+
+    private void handleDb(CommandSender sender, String[] args) {
+        String action = args.length >= 2 ? args[1].toLowerCase(Locale.ROOT) : "status";
+
+        if ("import".equals(action)) {
+            handleDbImport(sender, args);
+            return;
+        }
+
+        authService.fetchDatabaseHealthAsync(health -> {
+            DatabaseManager.DatabaseRuntimeSnapshot runtime = health.runtime();
+            DatabaseManager.QueryMetricsSnapshot query = runtime.queryMetrics();
+            DatabaseManager.MigrationSnapshot migrations = runtime.migrations();
+
+            if ("migrations".equals(action)) {
+                sendLine(sender, YELLOW + "Database migrations:");
+                sendLine(sender, GRAY + "type=" + WHITE + runtime.type()
+                        + GRAY + " current=" + WHITE + migrations.currentVersion()
+                        + GRAY + " latest=" + WHITE + migrations.latestVersion());
+                sendLine(sender, GRAY + "applied-this-startup=" + WHITE + migrations.appliedThisStartup());
+                sendLine(sender, GRAY + "pending=" + WHITE + migrations.pendingVersions());
+                return;
+            }
+
+            sendLine(sender, YELLOW + "Database health:");
+            sendLine(sender, GRAY + "type=" + WHITE + runtime.type()
+                    + GRAY + " healthy=" + WHITE + health.healthy()
+                    + GRAY + " ping=" + WHITE + health.pingMillis() + "ms"
+                    + GRAY + " note=" + WHITE + blankDash(health.note()));
+            sendLine(sender, GRAY + "pool active/idle/total/waiting=" + WHITE
+                    + runtime.activeConnections() + "/"
+                    + runtime.idleConnections() + "/"
+                    + runtime.totalConnections() + "/"
+                    + runtime.threadsAwaitingConnection());
+            sendLine(sender, GRAY + "queries total=" + WHITE + query.totalQueries()
+                    + GRAY + " failed=" + WHITE + query.failedQueries()
+                    + GRAY + " retries=" + WHITE + query.retriedQueries()
+                    + GRAY + " avg-ms=" + WHITE + formatDouble(query.averageQueryMillis()));
+
+            if (!query.topOperations().isEmpty()) {
+                sendLine(sender, YELLOW + "Top DB operations:");
+                for (DatabaseManager.QueryOperationSnapshot operation : query.topOperations()) {
+                    sendLine(sender, GRAY + operation.operation()
+                            + DARK_GRAY + " | " + GRAY + "count=" + WHITE + operation.totalQueries()
+                            + GRAY + " fail=" + WHITE + operation.failedQueries()
+                            + GRAY + " avg-ms=" + WHITE + formatDouble(operation.averageQueryMillis()));
+                }
+            }
+        });
+    }
+
+    private void handleDbImport(CommandSender sender, String[] args) {
+        if (args.length >= 3) {
+            String option = args[2].toLowerCase(Locale.ROOT);
+            if ("confirm".equals(option)) {
+                PendingImportRequest pending = pendingImports.remove(importKey(sender));
+                if (pending == null) {
+                    sendLine(sender, RED + "No pending import request. Run /authadmin db import [sqlite-file] first.");
+                    return;
+                }
+                if (!pending.isFresh()) {
+                    sendLine(sender, RED + "Pending import expired. Run preview again.");
+                    return;
+                }
+
+                sendLine(sender, YELLOW + "Starting import from " + WHITE + pending.sourcePath() + YELLOW + " ...");
+                authService.runSqliteImportAsync(pending.sourcePath(), result -> {
+                    if (!result.success()) {
+                        sendLine(sender, RED + "Import failed: " + result.note());
+                        return;
+                    }
+                    sendLine(sender, GREEN + "Import completed.");
+                    sendLine(sender, GRAY + "source=" + WHITE + result.sourcePath());
+                    sendLine(sender, GRAY + "scanned=" + WHITE + result.scannedRows()
+                            + GRAY + " imported=" + WHITE + result.importedRows()
+                            + GRAY + " skipped=" + WHITE + result.skippedRows()
+                            + GRAY + " failed=" + WHITE + result.failedRows());
+                });
+                return;
+            }
+
+            if ("cancel".equals(option)) {
+                pendingImports.remove(importKey(sender));
+                sendLine(sender, GREEN + "Pending import cancelled.");
+                return;
+            }
+        }
+
+        String sourcePath = args.length >= 3 ? args[2] : "authmanager.sqlite";
+        authService.previewSqliteImportAsync(sourcePath, preview -> {
+            if (!preview.ready()) {
+                sendLine(sender, RED + "Import preview failed: " + preview.note());
+                return;
+            }
+
+            String key = importKey(sender);
+            pendingImports.put(key, new PendingImportRequest(preview.resolvedPath(), System.currentTimeMillis()));
+            sendLine(sender, YELLOW + "Import preview ready:");
+            sendLine(sender, GRAY + "source=" + WHITE + preview.resolvedPath());
+            sendLine(sender, GRAY + "rows=" + WHITE + preview.totalRows()
+                    + GRAY + " invalid-uuid=" + WHITE + preview.invalidUuidRows()
+                    + GRAY + " missing-password=" + WHITE + preview.missingPasswordRows());
+            sendLine(sender, GOLD + "Confirm within 120s: /authadmin db import confirm");
+            sendLine(sender, GRAY + "Cancel: /authadmin db import cancel");
+        });
+    }
+
+    private void handleLookup(CommandSender sender, String[] args) {
+        if (args.length != 2) {
+            sendLine(sender, RED + "Usage: /authadmin lookup <player|ip>");
+            return;
+        }
+
+        String query = args[1];
+        sendLine(sender, YELLOW + "Lookup in progress: " + WHITE + query + GRAY + " ...");
+        authService.lookupIpInfoAsync(query, lookup -> {
+            if (!lookup.success()) {
+                sendLine(sender, RED + "Lookup failed: " + lookup.note());
+                return;
+            }
+
+            sendLine(sender, GREEN + "Lookup completed.");
+            sendLine(sender, GRAY + "query=" + WHITE + lookup.requestedQuery()
+                    + GRAY + " ip=" + WHITE + blankDash(lookup.resolvedIp()));
+            sendLine(sender, GRAY + "country=" + WHITE + blankDash(lookup.country())
+                    + GRAY + " code=" + WHITE + blankDash(lookup.countryCode()));
+            sendLine(sender, GRAY + "region=" + WHITE + blankDash(lookup.region())
+                    + GRAY + " city=" + WHITE + blankDash(lookup.city()));
+            sendLine(sender, GRAY + "isp=" + WHITE + blankDash(lookup.isp()));
+            sendLine(sender, GRAY + "org=" + WHITE + blankDash(lookup.organization())
+                    + GRAY + " asn=" + WHITE + blankDash(lookup.asn()));
+            sendLine(sender, GRAY + "proxy=" + WHITE + lookup.proxy()
+                    + GRAY + " hosting=" + WHITE + lookup.hosting()
+                    + GRAY + " mobile=" + WHITE + lookup.mobile());
+            sendLine(sender, GRAY + "suspicious=" + WHITE + lookup.suspicious()
+                    + GRAY + " source=" + WHITE + blankDash(lookup.source()));
         });
     }
 
@@ -221,25 +424,25 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
 
         OperationResult validation = authService.validateStartupConfiguration();
         if (validation.success()) {
-            sendLine(sender, GREEN + "Config ricaricata con successo.");
+            sendLine(sender, GREEN + "Configuration reloaded successfully.");
             return;
         }
 
         if (configManager.isStartupFailFastEnabled()) {
-            sendLine(sender, RED + "Configurazione non sicura: " + validation.message());
-            sendLine(sender, RED + "security.startup-fail-fast=true: plugin disabilitato.");
+            sendLine(sender, RED + "Unsafe configuration: " + validation.message());
+            sendLine(sender, RED + "security.startup-fail-fast=true: disabling plugin.");
             plugin.getLogger().severe(validation.message());
             Bukkit.getPluginManager().disablePlugin(plugin);
             return;
         }
 
-        sendLine(sender, GOLD + "Configurazione potenzialmente insicura: " + validation.message());
-        sendLine(sender, GOLD + "Continuo perche security.startup-fail-fast=false.");
+        sendLine(sender, GOLD + "Potentially unsafe configuration: " + validation.message());
+        sendLine(sender, GOLD + "Continuing because security.startup-fail-fast=false.");
     }
 
     private void handleRateLimit(CommandSender sender, String[] args) {
         if (args.length < 2) {
-            sendLine(sender, RED + "Uso: /authadmin ratelimit <status|clear>");
+            sendLine(sender, RED + "Usage: /authadmin ratelimit <status|clear>");
             return;
         }
 
@@ -257,21 +460,21 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
 
         if ("clear".equals(action)) {
             authService.resetAllSecurityLocks();
-            sendLine(sender, GREEN + "Rate-limit e account-lock resettati.");
+            sendLine(sender, GREEN + "Rate-limit and account-lock states were reset.");
             return;
         }
 
-        sendLine(sender, RED + "Uso: /authadmin ratelimit <status|clear>");
+        sendLine(sender, RED + "Usage: /authadmin ratelimit <status|clear>");
     }
 
     private void handleSessions(CommandSender sender) {
         List<AuthService.UnauthenticatedPlayerSnapshot> players = authService.snapshotUnauthenticatedPlayers();
         if (players.isEmpty()) {
-            sendLine(sender, GREEN + "Nessun giocatore in attesa di login/register.");
+            sendLine(sender, GREEN + "No players waiting for login/register.");
             return;
         }
 
-        sendLine(sender, YELLOW + "Giocatori non autenticati (" + players.size() + "):");
+        sendLine(sender, YELLOW + "Unauthenticated players (" + players.size() + "):");
         for (AuthService.UnauthenticatedPlayerSnapshot snapshot : players) {
             sendLine(sender, GRAY + snapshot.playerName()
                     + DARK_GRAY + " | "
@@ -282,7 +485,7 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
 
     private void handleUnlock(CommandSender sender, String[] args) {
         if (args.length < 2) {
-            sendLine(sender, RED + "Uso: /authadmin unlock <player>");
+            sendLine(sender, RED + "Usage: /authadmin unlock <player>");
             return;
         }
 
@@ -299,7 +502,7 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
 
     private void handleSetPassword(CommandSender sender, String[] args) {
         if (args.length < 3) {
-            sendLine(sender, RED + "Uso: /authadmin setpassword <player> <nuovaPassword>");
+            sendLine(sender, RED + "Usage: /authadmin setpassword <player> <newPassword>");
             return;
         }
 
@@ -311,13 +514,13 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
 
     private void handleForceAuth(CommandSender sender, String[] args) {
         if (args.length < 2) {
-            sendLine(sender, RED + "Uso: /authadmin forceauth <player>");
+            sendLine(sender, RED + "Usage: /authadmin forceauth <player>");
             return;
         }
 
         Player target = Bukkit.getPlayerExact(args[1]);
         if (target == null) {
-            sendLine(sender, RED + "Player non trovato online.");
+            sendLine(sender, RED + "Player not found online.");
             return;
         }
 
@@ -327,13 +530,13 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
 
     private void handleForceUnauth(CommandSender sender, String[] args) {
         if (args.length < 2) {
-            sendLine(sender, RED + "Uso: /authadmin forceunauth <player>");
+            sendLine(sender, RED + "Usage: /authadmin forceunauth <player>");
             return;
         }
 
         Player target = Bukkit.getPlayerExact(args[1]);
         if (target == null) {
-            sendLine(sender, RED + "Player non trovato online.");
+            sendLine(sender, RED + "Player not found online.");
             return;
         }
 
@@ -351,18 +554,18 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
         }
 
         int kicked = authService.kickUnauthenticatedPlayers(message, actorName(sender));
-        sendLine(sender, GREEN + "Giocatori non autenticati kickati: " + kicked);
+        sendLine(sender, GREEN + "Unauthenticated players kicked: " + kicked);
     }
 
     private void handlePacket(CommandSender sender, String[] args) {
         if (args.length < 3 || !"clear".equalsIgnoreCase(args[1])) {
-            sendLine(sender, RED + "Uso: /authadmin packet clear <player>");
+            sendLine(sender, RED + "Usage: /authadmin packet clear <player>");
             return;
         }
 
         Player target = Bukkit.getPlayerExact(args[2]);
         if (target == null) {
-            sendLine(sender, RED + "Player non trovato online.");
+            sendLine(sender, RED + "Player not found online.");
             return;
         }
 
@@ -372,7 +575,7 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
 
     private void handlePlayer(CommandSender sender, String[] args) {
         if (args.length < 2) {
-            sendLine(sender, RED + "Uso: /authadmin player <name>");
+            sendLine(sender, RED + "Usage: /authadmin player <name>");
             return;
         }
 
@@ -417,11 +620,27 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
         sender.sendMessage(configManager.applyPrefix(line));
     }
 
+    private String blankDash(String value) {
+        return value == null || value.isBlank() ? "-" : value;
+    }
+
     private String formatEpochMillis(long millis) {
         if (millis <= 0L) {
             return "-";
         }
         return DATE_TIME_FORMATTER.format(Instant.ofEpochMilli(millis));
+    }
+
+    private String formatDouble(double value) {
+        return String.format(Locale.US, "%.2f", value);
+    }
+
+    private String importKey(CommandSender sender) {
+        if (sender instanceof Player player) {
+            UUID id = player.getUniqueId();
+            return "player:" + id;
+        }
+        return "console:" + sender.getName().toLowerCase(Locale.ROOT);
     }
 
     private List<String> filterPrefix(String token, List<String> options) {
@@ -444,5 +663,11 @@ public final class AuthAdminCommand implements CommandExecutor, TabCompleter {
             }
         }
         return out;
+    }
+
+    private record PendingImportRequest(String sourcePath, long createdAtMillis) {
+        private boolean isFresh() {
+            return (System.currentTimeMillis() - createdAtMillis) <= IMPORT_CONFIRM_TTL_MILLIS;
+        }
     }
 }

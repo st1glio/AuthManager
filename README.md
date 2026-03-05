@@ -6,7 +6,7 @@ AuthManager provides secure `/register` and `/login` flows, premium identity ver
 
 ## Version
 
-- Current release: `BETA-1.3`
+- Current release: `BETA-1.4`
 - Java: `21`
 - Minecraft: `1.21+` (Paper/Purpur recommended)
 
@@ -18,7 +18,7 @@ AuthManager provides secure `/register` and `/login` flows, premium identity ver
 ## Quick Install
 
 1. Install `PacketEvents` in `plugins/`.
-2. Copy `AuthManager-BETA-1.3.jar` into `plugins/`.
+2. Copy `AuthManager-BETA-1.4.jar` into `plugins/`.
 3. Start the server once to generate files.
 4. Edit `plugins/AuthManager/config.yml`.
 5. Restart server (or use `/authadmin reload`).
@@ -32,6 +32,8 @@ AuthManager provides secure `/register` and `/login` flows, premium identity ver
 - Account lock after repeated failed attempts
 - Optional remembered sessions
 - IP intelligence checks (proxy/hosting/mobile/unknown)
+- Multi-database support (SQLite, MySQL, PostgreSQL)
+- DB pool health/metrics and migration tracking
 - Admin diagnostics and security commands
 
 ## Commands
@@ -43,12 +45,11 @@ AuthManager provides secure `/register` and `/login` flows, premium identity ver
 - `/changepassword <old> <new> <confirmation>`
 - `/logout`
 - `/authstatus`
-- `/lookup <player|ip>`
 - `/authadmin <subcommand>`
 
 ## Permissions
 
-- `authmanager.admin` -> required for `/authadmin` and `/lookup`
+- `authmanager.admin` -> required for `/authadmin` subcommands (`status`, `db`, `lookup`, etc.)
 
 Note: `/premium` and `/unpremium` are public in the current version.
 

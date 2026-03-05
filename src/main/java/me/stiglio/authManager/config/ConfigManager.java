@@ -40,6 +40,29 @@ public final class ConfigManager {
 
     private void applyDefaults() {
         config.addDefault("database-file", "authmanager.sqlite");
+        config.addDefault("database.type", "sqlite");
+        config.addDefault("database.sqlite.file", "authmanager.sqlite");
+        config.addDefault("database.mysql.host", "127.0.0.1");
+        config.addDefault("database.mysql.port", 3306);
+        config.addDefault("database.mysql.name", "authmanager");
+        config.addDefault("database.mysql.username", "root");
+        config.addDefault("database.mysql.password", "");
+        config.addDefault("database.mysql.ssl", false);
+        config.addDefault("database.postgresql.host", "127.0.0.1");
+        config.addDefault("database.postgresql.port", 5432);
+        config.addDefault("database.postgresql.name", "authmanager");
+        config.addDefault("database.postgresql.username", "postgres");
+        config.addDefault("database.postgresql.password", "");
+        config.addDefault("database.postgresql.ssl", false);
+        config.addDefault("database.pool.maximum-size", 10);
+        config.addDefault("database.pool.minimum-idle", 2);
+        config.addDefault("database.pool.connection-timeout-millis", 10000);
+        config.addDefault("database.pool.idle-timeout-millis", 600000);
+        config.addDefault("database.pool.max-lifetime-millis", 1800000);
+        config.addDefault("database.query-timeout-seconds", 5);
+        config.addDefault("database.retry.max-attempts", 3);
+        config.addDefault("database.retry.backoff-millis", 125);
+
         config.addDefault("min-password-length", 6);
         config.addDefault("auto-login-premium", true);
         config.addDefault("auth-reminder-seconds", 6);
@@ -51,6 +74,9 @@ public final class ConfigManager {
         config.addDefault("trusted-proxy-premium-identity", false);
         config.addDefault("auth-executor-threads", 2);
         config.addDefault("auth.blocked-message-cooldown-ms", 1500L);
+        config.addDefault("auth.online-user-cache.enabled", true);
+        config.addDefault("auth.online-user-cache.ttl-seconds", 20);
+        config.addDefault("auth.online-user-cache.max-entries", 2048);
         config.addDefault("auth.allowed-commands-while-unauthed",
                 List.of("login", "register", "authstatus", "l", "reg", "astatus"));
 
@@ -127,8 +153,112 @@ public final class ConfigManager {
         this.blockedPasswords = Collections.unmodifiableSet(blocked);
     }
 
+    public String getDatabaseType() {
+        String raw = config.getString("database.type", "sqlite");
+        if (raw == null || raw.isBlank()) {
+            return "sqlite";
+        }
+
+        String normalized = raw.trim().toLowerCase(Locale.ROOT);
+        return switch (normalized) {
+            case "mysql", "mariadb" -> "mysql";
+            case "postgres", "postgresql" -> "postgresql";
+            default -> "sqlite";
+        };
+    }
+
     public String getDatabaseFile() {
-        return config.getString("database-file", "authmanager.sqlite");
+        String fromSection = safeString("database.sqlite.file", "");
+        if (!fromSection.isBlank()) {
+            return fromSection;
+        }
+        return safeString("database-file", "authmanager.sqlite");
+    }
+
+    public String getDatabaseMysqlHost() {
+        return safeString("database.mysql.host", "127.0.0.1");
+    }
+
+    public int getDatabaseMysqlPort() {
+        int configured = config.getInt("database.mysql.port", 3306);
+        return configured < 1 || configured > 65535 ? 3306 : configured;
+    }
+
+    public String getDatabaseMysqlName() {
+        return safeString("database.mysql.name", "authmanager");
+    }
+
+    public String getDatabaseMysqlUsername() {
+        return safeString("database.mysql.username", "root");
+    }
+
+    public String getDatabaseMysqlPassword() {
+        return config.getString("database.mysql.password", "");
+    }
+
+    public boolean isDatabaseMysqlSsl() {
+        return config.getBoolean("database.mysql.ssl", false);
+    }
+
+    public String getDatabasePostgresqlHost() {
+        return safeString("database.postgresql.host", "127.0.0.1");
+    }
+
+    public int getDatabasePostgresqlPort() {
+        int configured = config.getInt("database.postgresql.port", 5432);
+        return configured < 1 || configured > 65535 ? 5432 : configured;
+    }
+
+    public String getDatabasePostgresqlName() {
+        return safeString("database.postgresql.name", "authmanager");
+    }
+
+    public String getDatabasePostgresqlUsername() {
+        return safeString("database.postgresql.username", "postgres");
+    }
+
+    public String getDatabasePostgresqlPassword() {
+        return config.getString("database.postgresql.password", "");
+    }
+
+    public boolean isDatabasePostgresqlSsl() {
+        return config.getBoolean("database.postgresql.ssl", false);
+    }
+
+    public int getDatabasePoolMaximumSize() {
+        return Math.max(2, config.getInt("database.pool.maximum-size", 10));
+    }
+
+    public int getDatabasePoolMinimumIdle() {
+        int configured = config.getInt("database.pool.minimum-idle", 2);
+        return Math.max(0, Math.min(getDatabasePoolMaximumSize() - 1, configured));
+    }
+
+    public long getDatabasePoolConnectionTimeoutMillis() {
+        long configured = config.getLong("database.pool.connection-timeout-millis", 10000L);
+        return Math.max(1000L, configured);
+    }
+
+    public long getDatabasePoolIdleTimeoutMillis() {
+        long configured = config.getLong("database.pool.idle-timeout-millis", 600000L);
+        return Math.max(10000L, configured);
+    }
+
+    public long getDatabasePoolMaxLifetimeMillis() {
+        long configured = config.getLong("database.pool.max-lifetime-millis", 1800000L);
+        return Math.max(30000L, configured);
+    }
+
+    public int getDatabaseQueryTimeoutSeconds() {
+        return Math.max(1, config.getInt("database.query-timeout-seconds", 5));
+    }
+
+    public int getDatabaseRetryMaxAttempts() {
+        return Math.max(1, config.getInt("database.retry.max-attempts", 3));
+    }
+
+    public long getDatabaseRetryBackoffMillis() {
+        return Math.max(0L, config.getLong("database.retry.backoff-millis", 125L));
     }
 
     public int getMinPasswordLength() {
@@ -172,6 +302,18 @@ public final class ConfigManager {
     public long getBlockedMessageCooldownMillis() {
         long configured = config.getLong("auth.blocked-message-cooldown-ms", 1500L);
         return Math.max(250L, configured);
+    }
+
+    public boolean isOnlineUserCacheEnabled() {
+        return config.getBoolean("auth.online-user-cache.enabled", true);
+    }
+
+    public int getOnlineUserCacheTtlSeconds() {
+        return Math.max(2, config.getInt("auth.online-user-cache.ttl-seconds", 20));
+    }
+
+    public int getOnlineUserCacheMaxEntries() {
+        return Math.max(64, config.getInt("auth.online-user-cache.max-entries", 2048));
     }
 
     public Set<String> getAllowedUnauthenticatedCommands() {
@@ -465,5 +607,10 @@ public final class ConfigManager {
 
     private String colorize(String text) {
         return MessageUtils.colorizeAmpersand(text);
+    }
+
+    private String safeString(String path, String fallback) {
+        String value = config.getString(path, fallback);
+        return value == null ? fallback : value.trim();
     }
 }

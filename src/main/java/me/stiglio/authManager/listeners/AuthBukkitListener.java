@@ -16,6 +16,7 @@ import org.bukkit.event.entity.EntityPickupItemEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.event.player.PlayerArmorStandManipulateEvent;
+import org.bukkit.event.player.AsyncPlayerChatEvent;
 import org.bukkit.event.player.PlayerBucketEmptyEvent;
 import org.bukkit.event.player.PlayerBucketFillEvent;
 import org.bukkit.event.player.PlayerCommandPreprocessEvent;
@@ -23,12 +24,14 @@ import org.bukkit.event.player.PlayerDropItemEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerInteractAtEntityEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
+import org.bukkit.event.player.PlayerItemHeldEvent;
 import org.bukkit.event.player.PlayerItemConsumeEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerKickEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerSwapHandItemsEvent;
+import org.bukkit.event.player.PlayerTeleportEvent;
 
 import java.util.Map;
 import java.util.UUID;
@@ -47,7 +50,7 @@ public final class AuthBukkitListener implements Listener {
         this.configManager = configManager;
     }
 
-    @EventHandler(priority = EventPriority.MONITOR)
+    @EventHandler(priority = EventPriority.LOWEST)
     public void onJoin(PlayerJoinEvent event) {
         authService.handleJoin(event.getPlayer());
         if (authService.shouldRestrictPlayer(event.getPlayer())) {
@@ -137,6 +140,26 @@ public final class AuthBukkitListener implements Listener {
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     public void onSwap(PlayerSwapHandItemsEvent event) {
+        if (!authService.shouldRestrictPlayer(event.getPlayer())) {
+            return;
+        }
+
+        event.setCancelled(true);
+        warnBlocked(event.getPlayer(), configManager.getMessage("action-blocked"));
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onItemHeld(PlayerItemHeldEvent event) {
+        if (!authService.shouldRestrictPlayer(event.getPlayer())) {
+            return;
+        }
+
+        event.setCancelled(true);
+        warnBlocked(event.getPlayer(), configManager.getMessage("action-blocked"));
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    public void onTeleport(PlayerTeleportEvent event) {
         if (!authService.shouldRestrictPlayer(event.getPlayer())) {
             return;
         }
@@ -261,7 +284,7 @@ public final class AuthBukkitListener implements Listener {
         warnBlocked(player, configManager.getMessage("action-blocked"));
     }
 
-    @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+    @EventHandler(priority = EventPriority.HIGHEST)
     public void onCommand(PlayerCommandPreprocessEvent event) {
         Player player = event.getPlayer();
         if (!authService.shouldRestrictPlayer(player)) {
@@ -278,6 +301,21 @@ public final class AuthBukkitListener implements Listener {
 
     @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
     public void onChat(AsyncChatEvent event) {
+        if (!configManager.isBlockChatWhileUnauthed()) {
+            return;
+        }
+
+        Player player = event.getPlayer();
+        if (!authService.shouldRestrictPlayer(player)) {
+            return;
+        }
+
+        event.setCancelled(true);
+        Bukkit.getScheduler().runTask(plugin, () -> warnBlocked(player, configManager.getMessage("chat-blocked")));
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onLegacyChat(AsyncPlayerChatEvent event) {
         if (!configManager.isBlockChatWhileUnauthed()) {
             return;
         }

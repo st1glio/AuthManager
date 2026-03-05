@@ -3,6 +3,7 @@ package me.stiglio.authManager.service;
 
 import me.stiglio.authManager.AuthManager;
 import me.stiglio.authManager.config.ConfigManager;
+import me.stiglio.authManager.database.DatabaseManager;
 import me.stiglio.authManager.database.UserDAO;
 import me.stiglio.authManager.mojang.MojangClient;
 import me.stiglio.authManager.mojang.MojangProfile;
@@ -12,21 +13,29 @@ import me.stiglio.authManager.utils.MessageUtils;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 
+import java.io.File;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -49,7 +58,12 @@ public final class AuthService {
     private volatile AuthRateLimiter rateLimiter;
     private volatile AccountLockManager accountLockManager;
     private final RememberedSessionStore rememberedSessionStore;
-    private final ExecutorService authExecutor;
+    private final ThreadPoolExecutor authExecutor;
+    private final long serviceStartedAtMillis;
+    private final OperationMetrics loginMetrics = new OperationMetrics();
+    private final OperationMetrics registerMetrics = new OperationMetrics();
+    private final OperationMetrics preLoginMetrics = new OperationMetrics();
+    private final OnlineUserCache onlineUserCache = new OnlineUserCache();
 
     private final Set<UUID> authenticatedPlayers = ConcurrentHashMap.newKeySet();
     private final Map<UUID, PendingAuthType> pendingAuth = new ConcurrentHashMap<>();
@@ -71,10 +85,11 @@ public final class AuthService {
         this.rateLimiter = buildRateLimiter();
         this.accountLockManager = buildAccountLockManager();
         this.rememberedSessionStore = new RememberedSessionStore();
-        this.authExecutor = Executors.newFixedThreadPool(
+        this.authExecutor = (ThreadPoolExecutor) Executors.newFixedThreadPool(
                 configManager.getAuthExecutorThreads(),
                 new AuthWorkerThreadFactory()
         );
+        this.serviceStartedAtMillis = System.currentTimeMillis();
         logVerificationMode();
     }
 
@@ -128,6 +143,7 @@ public final class AuthService {
             cleanupExpiredLoginStarts(System.currentTimeMillis());
             rememberedSessionStore.cleanupExpired();
             accountLockManager.cleanupExpired();
+            onlineUserCache.cleanupExpired();
         }, 20L * 60L, 20L * 60L);
     }
 
@@ -137,6 +153,7 @@ public final class AuthService {
         authDeadlines.clear();
         packetLoginIdentities.clear();
         pendingLoginStartIdentities.clear();
+        onlineUserCache.clear();
 
         if (reminderTaskId != -1) {
             Bukkit.getScheduler().cancelTask(reminderTaskId);
@@ -189,6 +206,7 @@ public final class AuthService {
         if (!configManager.isRememberSessionEnabled()) {
             rememberedSessionStore.clearAll();
         }
+        onlineUserCache.clear();
         ipIntelligenceClient.clearCache();
         if (reminderTaskId != -1 || authTimeoutTaskId != -1) {
             if (reminderTaskId != -1) {
@@ -209,26 +227,36 @@ public final class AuthService {
     }
 
     public OperationResult checkPreLoginRateLimit(String playerName, String ipAddress) {
+        long startedAt = System.nanoTime();
+        OperationResult result;
         if (!configManager.isRateLimitEnabled() || !configManager.isPreLoginRateLimitEnabled()) {
-            return new OperationResult(true, "");
+            result = new OperationResult(true, "");
+            preLoginMetrics.record(result.success(), System.nanoTime() - startedAt);
+            return result;
         }
 
         AuthRateLimiter.Decision before = rateLimiter.checkIpOnly(AuthRateLimiter.Action.PRE_LOGIN, ipAddress);
         if (before.blocked()) {
             audit("prelogin_rate_limited", playerName, null, ipAddress, "blocked_existing_cooldown");
-            return new OperationResult(false, configManager.getMessage("rate-limit-pre-login-blocked",
+            result = new OperationResult(false, configManager.getMessage("rate-limit-pre-login-blocked",
                     "{seconds}", String.valueOf(before.secondsLeft())));
+            preLoginMetrics.record(result.success(), System.nanoTime() - startedAt);
+            return result;
         }
 
         rateLimiter.recordFailureIpOnly(AuthRateLimiter.Action.PRE_LOGIN, ipAddress);
         AuthRateLimiter.Decision after = rateLimiter.checkIpOnly(AuthRateLimiter.Action.PRE_LOGIN, ipAddress);
         if (!after.blocked()) {
-            return new OperationResult(true, "");
+            result = new OperationResult(true, "");
+            preLoginMetrics.record(result.success(), System.nanoTime() - startedAt);
+            return result;
         }
 
         audit("prelogin_rate_limited", playerName, null, ipAddress, "burst_detected");
-        return new OperationResult(false, configManager.getMessage("rate-limit-pre-login-blocked",
+        result = new OperationResult(false, configManager.getMessage("rate-limit-pre-login-blocked",
                 "{seconds}", String.valueOf(after.secondsLeft())));
+        preLoginMetrics.record(result.success(), System.nanoTime() - startedAt);
+        return result;
     }
 
     public void resetAllRateLimits() {
@@ -249,6 +277,13 @@ public final class AuthService {
             }
         }
 
+        DatabaseManager.DatabaseRuntimeSnapshot databaseRuntime = userDAO.snapshotDatabaseRuntime();
+        MetricsSnapshot loginStats = loginMetrics.snapshot();
+        MetricsSnapshot registerStats = registerMetrics.snapshot();
+        MetricsSnapshot preLoginStats = preLoginMetrics.snapshot();
+        OnlineUserCacheSnapshot cache = onlineUserCache.snapshot();
+        long uptimeSeconds = Math.max(0L, (System.currentTimeMillis() - serviceStartedAtMillis) / 1000L);
+
         return new AdminStatusSnapshot(
                 Bukkit.getOnlineMode(),
                 configManager.isPremiumNameProtectionEnabled(),
@@ -266,7 +301,29 @@ public final class AuthService {
                 authenticatedPlayers.size(),
                 pendingAuth.size(),
                 packetLoginIdentities.size(),
-                rememberedSessionStore.size()
+                rememberedSessionStore.size(),
+                uptimeSeconds,
+                authExecutor.getPoolSize(),
+                authExecutor.getActiveCount(),
+                authExecutor.getQueue().size(),
+                loginStats,
+                registerStats,
+                preLoginStats,
+                databaseRuntime,
+                cache
+        );
+    }
+
+    public void fetchDetailedStatusAsync(Consumer<DetailedStatusSnapshot> callback) {
+        AdminStatusSnapshot runtime = snapshotStatus();
+        runAsyncTask(
+                userDAO::checkDatabaseHealth,
+                health -> callback.accept(new DetailedStatusSnapshot(runtime, health)),
+                error -> callback.accept(new DetailedStatusSnapshot(runtime,
+                        new DatabaseManager.DatabaseHealthSnapshot(false,
+                                "health_check_failed:" + sanitize(error.getMessage()),
+                                0L,
+                                runtime.databaseRuntime())))
         );
     }
 
@@ -301,7 +358,7 @@ public final class AuthService {
         long rememberedSeconds = rememberedSessionStore.secondsLeft(playerName);
         AccountLockManager.Decision lockDecision = accountLockManager.check(playerName);
 
-        runAsyncTask(() -> userDAO.findByName(playerName).orElse(null), user -> {
+        runAsyncTask(() -> findUserForOnline(playerId, playerName).orElse(null), user -> {
             callback.accept(new PlayerStatusSnapshot(
                     playerName,
                     user != null,
@@ -409,6 +466,18 @@ public final class AuthService {
         }, callback, error -> callback.accept(new DatabaseStatsSnapshot(0, 0, 0, 0, activeWindowDays)));
     }
 
+    public void fetchDatabaseHealthAsync(Consumer<DatabaseManager.DatabaseHealthSnapshot> callback) {
+        runAsyncTask(
+                userDAO::checkDatabaseHealth,
+                callback,
+                error -> callback.accept(new DatabaseManager.DatabaseHealthSnapshot(
+                        false,
+                        "health_check_failed:" + sanitize(error.getMessage()),
+                        0L,
+                        userDAO.snapshotDatabaseRuntime()))
+        );
+    }
+
     public void lookupIpInfoAsync(String queryOrPlayer, Consumer<IpLookupSnapshot> callback) {
         runAsyncTask(() -> resolveAndLookupIp(queryOrPlayer),
                 callback,
@@ -433,7 +502,13 @@ public final class AuthService {
     }
 
     public void describePlayerAsync(String playerName, Consumer<AdminPlayerSnapshot> callback) {
-        runAsyncTask(() -> userDAO.findByName(playerName).orElse(null), user -> {
+        runAsyncTask(() -> {
+            Player online = Bukkit.getPlayerExact(playerName);
+            if (online != null) {
+                return findUserForOnline(online.getUniqueId(), online.getName()).orElse(null);
+            }
+            return userDAO.findByName(playerName).orElse(null);
+        }, user -> {
             Player online = Bukkit.getPlayerExact(playerName);
             UUID onlineUuid = online != null ? online.getUniqueId() : null;
             UUID lookupUuid = user != null ? user.getUuid() : onlineUuid;
@@ -460,6 +535,25 @@ public final class AuthService {
                 false, null, false, 0L, 0L, "", false, 0L, true,
                 "lookup_failed:" + error.getMessage())));
     }
+
+    public void previewSqliteImportAsync(String sourcePath, Consumer<SqliteImportPreview> callback) {
+        runAsyncTask(
+                () -> previewSqliteImport(sourcePath),
+                callback,
+                error -> callback.accept(new SqliteImportPreview(false,
+                        safeMessage(error), "", 0, 0, 0))
+        );
+    }
+
+    public void runSqliteImportAsync(String sourcePath, Consumer<SqliteImportResult> callback) {
+        runAsyncTask(
+                () -> importFromSqlite(sourcePath),
+                callback,
+                error -> callback.accept(new SqliteImportResult(false,
+                        safeMessage(error), "", 0, 0, 0, 0))
+        );
+    }
+
     public void trackLoginStartIdentity(String loginName, String loginIp, UUID loginStartUuid) {
         if (loginName == null || loginName.isBlank()) {
             return;
@@ -518,7 +612,7 @@ public final class AuthService {
 
         markPendingAuthentication(playerId, PendingAuthType.REGISTER);
 
-        runAsyncTask(() -> resolveJoin(playerName, ip),
+        runAsyncTask(() -> resolveJoin(playerId, playerName, ip),
                 joinResolution -> {
                     Player online = Bukkit.getPlayer(playerId);
                     if (online == null || !online.isOnline()) {
@@ -544,7 +638,7 @@ public final class AuthService {
                     if (online != null && online.isOnline()) {
                         online.kick(MessageUtils.toComponent(configManager.getMessage("action-blocked")));
                     }
-                    plugin.getLogger().warning("Join auth lookup failed for " + playerName + ": " + error.getMessage());
+                    logWarn("AUTH", "Join lookup failed player=" + playerName + " error=" + safeMessage(error));
                     audit("join_lookup_error", playerName, playerId, ip, "dao_error");
                 });
     }
@@ -554,6 +648,7 @@ public final class AuthService {
         pendingAuth.remove(playerId);
         authDeadlines.remove(playerId);
         packetLoginIdentities.remove(playerId);
+        onlineUserCache.invalidate(playerId);
     }
 
     public boolean isAuthenticated(UUID playerId) {
@@ -581,7 +676,7 @@ public final class AuthService {
                 () -> registerBlocking(playerId, playerName, password, confirmation, ip),
                 result -> deliverIfOnline(playerId, callback, result),
                 error -> {
-                    plugin.getLogger().warning("Register operation failed for " + playerName + ": " + error.getMessage());
+                    logWarn("AUTH", "Register async failure player=" + playerName + " error=" + safeMessage(error));
                     audit("register_error", playerName, playerId, ip, "unexpected_error");
                     deliverIfOnline(playerId, callback, new OperationResult(false, configManager.getMessage("action-blocked")));
                 }
@@ -597,7 +692,7 @@ public final class AuthService {
                 () -> loginBlocking(playerId, playerName, password, ip),
                 result -> deliverIfOnline(playerId, callback, result),
                 error -> {
-                    plugin.getLogger().warning("Login operation failed for " + playerName + ": " + error.getMessage());
+                    logWarn("AUTH", "Login async failure player=" + playerName + " error=" + safeMessage(error));
                     audit("login_error", playerName, playerId, ip, "unexpected_error");
                     deliverIfOnline(playerId, callback, new LoginAttemptResult(false, configManager.getMessage("action-blocked"), false));
                 }
@@ -614,7 +709,7 @@ public final class AuthService {
                 () -> changePasswordBlocking(playerId, playerName, oldPassword, newPassword, confirmation, ip),
                 result -> deliverIfOnline(playerId, callback, result),
                 error -> {
-                    plugin.getLogger().warning("Change password failed for " + playerName + ": " + error.getMessage());
+                    logWarn("AUTH", "Change password async failure player=" + playerName + " error=" + safeMessage(error));
                     audit("change_password_error", playerName, playerId, ip, "unexpected_error");
                     deliverIfOnline(playerId, callback, new OperationResult(false, configManager.getMessage("action-blocked")));
                 }
@@ -630,7 +725,7 @@ public final class AuthService {
                 () -> logoutBlocking(playerId, playerName, ip),
                 result -> deliverIfOnline(playerId, callback, result),
                 error -> {
-                    plugin.getLogger().warning("Logout operation failed for " + playerName + ": " + error.getMessage());
+                    logWarn("AUTH", "Logout async failure player=" + playerName + " error=" + safeMessage(error));
                     audit("logout_error", playerName, playerId, ip, "unexpected_error");
                     deliverIfOnline(playerId, callback, new OperationResult(false, configManager.getMessage("action-blocked")));
                 }
@@ -646,7 +741,7 @@ public final class AuthService {
                 () -> verifyPremiumOwnership(playerId, playerName, ip),
                 result -> deliverIfOnline(playerId, callback, result),
                 error -> {
-                    plugin.getLogger().warning("Premium verification failed for " + playerName + ": " + error.getMessage());
+                    logWarn("AUTH", "Premium verify async failure player=" + playerName + " error=" + safeMessage(error));
                     audit("premium_verify_error", playerName, playerId, ip, "unexpected_error");
                     deliverIfOnline(playerId, callback, new OperationResult(false, configManager.getMessage("action-blocked")));
                 }
@@ -662,7 +757,7 @@ public final class AuthService {
                 () -> setPremium(playerId, playerName, premium, ip),
                 result -> deliverIfOnline(playerId, callback, result),
                 error -> {
-                    plugin.getLogger().warning("Set premium failed for " + playerName + ": " + error.getMessage());
+                    logWarn("AUTH", "Set premium async failure player=" + playerName + " error=" + safeMessage(error));
                     audit("premium_toggle_error", playerName, playerId, ip, "unexpected_error");
                     deliverIfOnline(playerId, callback, new OperationResult(false, configManager.getMessage("action-blocked")));
                 }
@@ -700,7 +795,7 @@ public final class AuthService {
         try {
             locallyMarkedPremium = userDAO.findByName(playerName).map(User::isPremium).orElse(false);
         } catch (RuntimeException exception) {
-            plugin.getLogger().warning("Pre-login local premium lookup failed for " + playerName + ": " + exception.getMessage());
+            logWarn("SECURITY", "Pre-login local premium lookup failed player=" + playerName + " error=" + safeMessage(exception));
             audit("prelogin_deny", playerName, preLoginUuid, safeIp, "dao_error");
             return new OperationResult(false, configManager.getMessage("action-blocked"));
         }
@@ -792,18 +887,24 @@ public final class AuthService {
         audit("player_kick", player.getName(), player.getUniqueId(), extractPlayerIp(player), reason);
     }
 
-    private JoinResolution resolveJoin(String playerName, String ip) {
-        User user = userDAO.findByName(playerName).orElse(null);
+    private JoinResolution resolveJoin(UUID playerId, String playerName, String ip) {
+        User user = findUserForOnline(playerId, playerName).orElse(null);
         if (user == null) {
             return new JoinResolution(PendingAuthType.REGISTER, false, "none");
         }
 
         if (!user.getUsername().equals(playerName)) {
-            userDAO.updateName(user.getUuid(), playerName);
+            if (userDAO.updateName(user.getUuid(), playerName)) {
+                User renamed = new User(user.getUuid(), playerName, user.getPasswordHash(), user.isPremium(),
+                        user.getCreatedAt(), user.getLastLoginAt(), user.getLastLoginIp());
+                cacheUser(playerId, playerName, renamed);
+                user = renamed;
+            }
         }
 
         if (user.isPremium() && configManager.isAutoLoginPremium()) {
             userDAO.updateLastLogin(user.getUuid(), ip);
+            cacheUser(playerId, playerName, withLastLogin(user, ip));
             rememberSession(playerName, ip);
             return new JoinResolution(PendingAuthType.LOGIN, true, "premium");
         }
@@ -811,6 +912,7 @@ public final class AuthService {
         if (configManager.isRememberSessionEnabled()
                 && rememberedSessionStore.hasValidSession(playerName, ip, configManager.isRememberSessionRequireSameIp())) {
             userDAO.updateLastLogin(user.getUuid(), ip);
+            cacheUser(playerId, playerName, withLastLogin(user, ip));
             return new JoinResolution(PendingAuthType.LOGIN, true, "remembered_session");
         }
 
@@ -818,26 +920,35 @@ public final class AuthService {
     }
 
     private OperationResult registerBlocking(UUID playerId, String playerName, String password, String confirmation, String ip) {
-        if (isAuthenticated(playerId)) {
-            return new OperationResult(false, configManager.getMessage("already-authenticated"));
-        }
-
-        OperationResult passwordPolicy = validatePasswordPolicy(playerName, password, confirmation);
-        if (!passwordPolicy.success()) {
-            return passwordPolicy;
-        }
-
-        AuthRateLimiter.Decision decision = rateLimitDecision(AuthRateLimiter.Action.REGISTER, playerName, ip);
-        if (decision.blocked()) {
-            audit("register_blocked", playerName, playerId, ip, "rate_limited");
-            return rateLimitedMessage(AuthRateLimiter.Action.REGISTER, decision);
-        }
-
+        long startedAt = System.nanoTime();
+        OperationResult result;
         try {
-            if (userDAO.findByName(playerName).isPresent()) {
+            if (isAuthenticated(playerId)) {
+                result = new OperationResult(false, configManager.getMessage("already-authenticated"));
+                registerMetrics.record(result.success(), System.nanoTime() - startedAt);
+                return result;
+            }
+
+            OperationResult passwordPolicy = validatePasswordPolicy(playerName, password, confirmation);
+            if (!passwordPolicy.success()) {
+                registerMetrics.record(passwordPolicy.success(), System.nanoTime() - startedAt);
+                return passwordPolicy;
+            }
+
+            AuthRateLimiter.Decision decision = rateLimitDecision(AuthRateLimiter.Action.REGISTER, playerName, ip);
+            if (decision.blocked()) {
+                audit("register_blocked", playerName, playerId, ip, "rate_limited");
+                result = rateLimitedMessage(AuthRateLimiter.Action.REGISTER, decision);
+                registerMetrics.record(result.success(), System.nanoTime() - startedAt);
+                return result;
+            }
+
+            if (findUserForOnline(playerId, playerName).isPresent()) {
                 rateLimiter.recordFailure(AuthRateLimiter.Action.REGISTER, playerName, ip);
                 audit("register_fail", playerName, playerId, ip, "already_registered");
-                return new OperationResult(false, configManager.getMessage("already-registered"));
+                result = new OperationResult(false, configManager.getMessage("already-registered"));
+                registerMetrics.record(result.success(), System.nanoTime() - startedAt);
+                return result;
             }
 
             if (configManager.isMultiAccountProtectionEnabled()) {
@@ -847,8 +958,10 @@ public final class AuthService {
                     rateLimiter.recordFailure(AuthRateLimiter.Action.REGISTER, playerName, ip);
                     audit("register_blocked", playerName, playerId, ip,
                             "multi_account_ip_limit_reached:" + existingAccountsOnIp + "/" + maxAccountsPerIp);
-                    return new OperationResult(false, configManager.getMessage("register-ip-limit-reached",
+                    result = new OperationResult(false, configManager.getMessage("register-ip-limit-reached",
                             "{max}", String.valueOf(maxAccountsPerIp)));
+                    registerMetrics.record(result.success(), System.nanoTime() - startedAt);
+                    return result;
                 }
             }
 
@@ -857,68 +970,92 @@ public final class AuthService {
             if (!created) {
                 rateLimiter.recordFailure(AuthRateLimiter.Action.REGISTER, playerName, ip);
                 audit("register_fail", playerName, playerId, ip, "create_user_failed");
-                return new OperationResult(false, configManager.getMessage("already-registered"));
+                result = new OperationResult(false, configManager.getMessage("already-registered"));
+                registerMetrics.record(result.success(), System.nanoTime() - startedAt);
+                return result;
             }
 
+            long now = System.currentTimeMillis();
+            User createdUser = new User(playerId, playerName, passwordHash, false, now, now, ip);
+            cacheUser(playerId, playerName, createdUser);
             rateLimiter.recordSuccess(AuthRateLimiter.Action.REGISTER, playerName, ip);
             accountLockManager.recordSuccess(playerName);
             markAuthenticated(playerId);
             rememberSession(playerName, ip);
             audit("register_success", playerName, playerId, ip, "created");
-            return new OperationResult(true, configManager.getMessage("register-success"));
+            result = new OperationResult(true, configManager.getMessage("register-success"));
         } catch (RuntimeException exception) {
-            plugin.getLogger().warning("Register DB/hash error for " + playerName + ": " + exception.getMessage());
+            logWarn("AUTH", "Register failed player=" + playerName + " error=" + safeMessage(exception));
             audit("register_error", playerName, playerId, ip, "dao_or_hash_error");
-            return new OperationResult(false, configManager.getMessage("action-blocked"));
+            result = new OperationResult(false, configManager.getMessage("action-blocked"));
         }
+
+        registerMetrics.record(result.success(), System.nanoTime() - startedAt);
+        return result;
     }
 
     private LoginAttemptResult loginBlocking(UUID playerId, String playerName, String password, String ip) {
-        if (isAuthenticated(playerId)) {
-            return new LoginAttemptResult(false, configManager.getMessage("already-authenticated"), false);
-        }
-
-        AccountLockManager.Decision accountLockDecision = accountLockManager.check(playerName);
-        if (accountLockDecision.blocked()) {
-            audit("login_blocked", playerName, playerId, ip, "account_locked");
-            return new LoginAttemptResult(false, configManager.getMessage("account-locked",
-                    "{seconds}", String.valueOf(accountLockDecision.secondsLeft())), true);
-        }
-
-        AuthRateLimiter.Decision decision = rateLimitDecision(AuthRateLimiter.Action.LOGIN, playerName, ip);
-        if (decision.blocked()) {
-            audit("login_blocked", playerName, playerId, ip, "rate_limited");
-            return new LoginAttemptResult(false, rateLimitedMessage(AuthRateLimiter.Action.LOGIN, decision).message(), true);
-        }
-
+        long startedAt = System.nanoTime();
+        LoginAttemptResult result;
         try {
-            User user = userDAO.findByName(playerName).orElse(null);
+            if (isAuthenticated(playerId)) {
+                result = new LoginAttemptResult(false, configManager.getMessage("already-authenticated"), false);
+                loginMetrics.record(result.success(), System.nanoTime() - startedAt);
+                return result;
+            }
+
+            AccountLockManager.Decision accountLockDecision = accountLockManager.check(playerName);
+            if (accountLockDecision.blocked()) {
+                audit("login_blocked", playerName, playerId, ip, "account_locked");
+                result = new LoginAttemptResult(false, configManager.getMessage("account-locked",
+                        "{seconds}", String.valueOf(accountLockDecision.secondsLeft())), true);
+                loginMetrics.record(result.success(), System.nanoTime() - startedAt);
+                return result;
+            }
+
+            AuthRateLimiter.Decision decision = rateLimitDecision(AuthRateLimiter.Action.LOGIN, playerName, ip);
+            if (decision.blocked()) {
+                audit("login_blocked", playerName, playerId, ip, "rate_limited");
+                result = new LoginAttemptResult(false, rateLimitedMessage(AuthRateLimiter.Action.LOGIN, decision).message(), true);
+                loginMetrics.record(result.success(), System.nanoTime() - startedAt);
+                return result;
+            }
+
+            User user = findUserForOnline(playerId, playerName).orElse(null);
             if (user == null) {
                 rateLimiter.recordFailure(AuthRateLimiter.Action.LOGIN, playerName, ip);
                 accountLockManager.recordFailure(playerName);
                 audit("login_fail", playerName, playerId, ip, "not_registered");
-                return new LoginAttemptResult(false, configManager.getMessage("not-registered"), false);
+                result = new LoginAttemptResult(false, configManager.getMessage("not-registered"), false);
+                loginMetrics.record(result.success(), System.nanoTime() - startedAt);
+                return result;
             }
 
             if (!HashUtils.checkPassword(password, user.getPasswordHash())) {
                 rateLimiter.recordFailure(AuthRateLimiter.Action.LOGIN, playerName, ip);
                 accountLockManager.recordFailure(playerName);
                 audit("login_fail", playerName, playerId, ip, "invalid_password");
-                return new LoginAttemptResult(false, configManager.getMessage("login-failed-kick"), true);
+                result = new LoginAttemptResult(false, configManager.getMessage("login-failed-kick"), true);
+                loginMetrics.record(result.success(), System.nanoTime() - startedAt);
+                return result;
             }
 
             markAuthenticated(playerId);
             userDAO.updateLastLogin(user.getUuid(), ip);
+            cacheUser(playerId, playerName, withLastLogin(user, ip));
             rateLimiter.recordSuccess(AuthRateLimiter.Action.LOGIN, playerName, ip);
             accountLockManager.recordSuccess(playerName);
             rememberSession(playerName, ip);
             audit("login_success", playerName, playerId, ip, "password_ok");
-            return new LoginAttemptResult(true, configManager.getMessage("login-success"), false);
+            result = new LoginAttemptResult(true, configManager.getMessage("login-success"), false);
         } catch (RuntimeException exception) {
-            plugin.getLogger().warning("Login DB/hash error for " + playerName + ": " + exception.getMessage());
+            logWarn("AUTH", "Login failed player=" + playerName + " error=" + safeMessage(exception));
             audit("login_error", playerName, playerId, ip, "dao_or_hash_error");
-            return new LoginAttemptResult(false, configManager.getMessage("action-blocked"), false);
+            result = new LoginAttemptResult(false, configManager.getMessage("action-blocked"), false);
         }
+
+        loginMetrics.record(result.success(), System.nanoTime() - startedAt);
+        return result;
     }
     private OperationResult logoutBlocking(UUID playerId, String playerName, String ip) {
         if (!isAuthenticated(playerId)) {
@@ -926,7 +1063,7 @@ public final class AuthService {
         }
 
         try {
-            User user = userDAO.findByName(playerName).orElse(null);
+            User user = findUserForOnline(playerId, playerName).orElse(null);
             if (user == null) {
                 return new OperationResult(false, configManager.getMessage("not-registered"));
             }
@@ -940,7 +1077,7 @@ public final class AuthService {
             audit("logout_success", playerName, playerId, ip, "manual_logout");
             return new OperationResult(true, configManager.getMessage("logout-success"));
         } catch (RuntimeException exception) {
-            plugin.getLogger().warning("Logout DB error for " + playerName + ": " + exception.getMessage());
+            logWarn("AUTH", "Logout failed player=" + playerName + " error=" + safeMessage(exception));
             audit("logout_error", playerName, playerId, ip, "dao_error");
             return new OperationResult(false, configManager.getMessage("action-blocked"));
         }
@@ -958,7 +1095,7 @@ public final class AuthService {
         }
 
         try {
-            User user = userDAO.findByName(playerName).orElse(null);
+            User user = findUserForOnline(playerId, playerName).orElse(null);
             if (user == null) {
                 return new OperationResult(false, configManager.getMessage("not-registered"));
             }
@@ -979,11 +1116,13 @@ public final class AuthService {
                 return new OperationResult(false, configManager.getMessage("action-blocked"));
             }
 
+            cacheUser(playerId, playerName, new User(user.getUuid(), user.getUsername(), newHash,
+                    user.isPremium(), user.getCreatedAt(), user.getLastLoginAt(), user.getLastLoginIp()));
             rememberSession(playerName, ip);
             audit("change_password_success", playerName, playerId, ip, "updated");
             return new OperationResult(true, configManager.getMessage("password-changed"));
         } catch (RuntimeException exception) {
-            plugin.getLogger().warning("Change password DB/hash error for " + playerName + ": " + exception.getMessage());
+            logWarn("AUTH", "Change password failed player=" + playerName + " error=" + safeMessage(exception));
             audit("change_password_error", playerName, playerId, ip, "dao_or_hash_error");
             return new OperationResult(false, configManager.getMessage("action-blocked"));
         }
@@ -1066,7 +1205,7 @@ public final class AuthService {
         }
 
         if (!strict && !Bukkit.getOnlineMode()) {
-            plugin.getLogger().warning("Compatibility premium verification accepted in offline-mode for " + playerName + ". This is best-effort only.");
+            logWarn("SECURITY", "Compatibility premium verification accepted in offline-mode player=" + playerName + " mode=best_effort");
             audit("premium_verify_warn", playerName, playerId, currentIp, "compatibility_offline_best_effort");
         }
 
@@ -1080,7 +1219,7 @@ public final class AuthService {
         }
 
         try {
-            User user = userDAO.findByName(playerName).orElse(null);
+            User user = findUserForOnline(playerId, playerName).orElse(null);
             if (user == null) {
                 return new OperationResult(false, configManager.getMessage("not-registered"));
             }
@@ -1099,12 +1238,14 @@ public final class AuthService {
             if (premium) {
                 rememberSession(playerName, ip);
             }
+            cacheUser(playerId, playerName, new User(user.getUuid(), user.getUsername(), user.getPasswordHash(),
+                    premium, user.getCreatedAt(), user.getLastLoginAt(), user.getLastLoginIp()));
             audit("premium_toggle_success", playerName, playerId, ip, premium ? "enabled" : "disabled");
             return new OperationResult(true, premium
                     ? configManager.getMessage("premium-enabled")
                     : configManager.getMessage("premium-disabled"));
         } catch (RuntimeException exception) {
-            plugin.getLogger().warning("Set premium DB error for " + playerName + ": " + exception.getMessage());
+            logWarn("AUTH", "Set premium failed player=" + playerName + " error=" + safeMessage(exception));
             audit("premium_toggle_error", playerName, playerId, ip, "dao_error");
             return new OperationResult(false, configManager.getMessage("action-blocked"));
         }
@@ -1256,10 +1397,24 @@ public final class AuthService {
             accountLockManager.recordSuccess(targetName);
             rateLimiter.clearPlayer(targetName);
             clearRememberedSession(targetName);
+            Player online = Bukkit.getPlayerExact(targetName);
+            if (online != null) {
+                cacheUser(online.getUniqueId(), online.getName(), new User(
+                        target.getUuid(),
+                        online.getName(),
+                        hash,
+                        target.isPremium(),
+                        target.getCreatedAt(),
+                        target.getLastLoginAt(),
+                        target.getLastLoginIp()
+                ));
+            } else {
+                onlineUserCache.invalidateName(targetName);
+            }
             audit("admin_password_reset", targetName, target.getUuid(), target.getLastLoginIp(), actor);
             return new OperationResult(true, "Password updated for " + targetName + ".");
         } catch (RuntimeException exception) {
-            plugin.getLogger().warning("Admin password reset failed for " + targetName + ": " + exception.getMessage());
+            logWarn("AUTH", "Admin password reset failed target=" + targetName + " error=" + safeMessage(exception));
             return new OperationResult(false, configManager.getMessage("action-blocked"));
         }
     }
@@ -1366,6 +1521,130 @@ public final class AuthService {
         );
     }
 
+    private SqliteImportPreview previewSqliteImport(String sourcePath) {
+        if (userDAO.getDatabaseType() == DatabaseManager.DatabaseType.SQLITE) {
+            return new SqliteImportPreview(false,
+                    "Current backend is sqlite. Switch database.type to mysql/postgresql before importing.",
+                    "",
+                    0,
+                    0,
+                    0);
+        }
+
+        File sourceFile = resolveSourceFile(sourcePath);
+        if (!sourceFile.exists() || !sourceFile.isFile()) {
+            return new SqliteImportPreview(false, "Source sqlite file not found.", sourceFile.getAbsolutePath(), 0, 0, 0);
+        }
+
+        String sql = "SELECT uuid, password FROM users";
+        int rows = 0;
+        int invalidUuidRows = 0;
+        int missingPasswordRows = 0;
+
+        try (Connection source = DriverManager.getConnection("jdbc:sqlite:" + sourceFile.getAbsolutePath());
+             PreparedStatement statement = source.prepareStatement(sql);
+             ResultSet result = statement.executeQuery()) {
+            while (result.next()) {
+                rows++;
+                String uuidRaw = result.getString("uuid");
+                String password = result.getString("password");
+                if (uuidRaw == null || uuidRaw.isBlank()) {
+                    invalidUuidRows++;
+                } else {
+                    try {
+                        UUID.fromString(uuidRaw);
+                    } catch (IllegalArgumentException ignored) {
+                        invalidUuidRows++;
+                    }
+                }
+
+                if (password == null || password.isBlank()) {
+                    missingPasswordRows++;
+                }
+            }
+        } catch (SQLException exception) {
+            return new SqliteImportPreview(false, "Failed to read sqlite source: " + safeMessage(exception),
+                    sourceFile.getAbsolutePath(), 0, 0, 0);
+        }
+
+        return new SqliteImportPreview(
+                true,
+                "ready",
+                sourceFile.getAbsolutePath(),
+                rows,
+                invalidUuidRows,
+                missingPasswordRows
+        );
+    }
+
+    private SqliteImportResult importFromSqlite(String sourcePath) {
+        SqliteImportPreview preview = previewSqliteImport(sourcePath);
+        if (!preview.ready()) {
+            return new SqliteImportResult(false, preview.note(), preview.resolvedPath(), 0, 0, 0, 0);
+        }
+
+        int scanned = 0;
+        int imported = 0;
+        int skipped = 0;
+        int failed = 0;
+
+        String sql = "SELECT uuid, name, password, premium, created_at, last_login_at, last_login_ip FROM users";
+        try (Connection source = DriverManager.getConnection("jdbc:sqlite:" + preview.resolvedPath());
+             PreparedStatement statement = source.prepareStatement(sql);
+             ResultSet result = statement.executeQuery()) {
+            while (result.next()) {
+                scanned++;
+                try {
+                    String uuidRaw = result.getString("uuid");
+                    String name = result.getString("name");
+                    String password = result.getString("password");
+                    if (uuidRaw == null || uuidRaw.isBlank()
+                            || name == null || name.isBlank()
+                            || password == null || password.isBlank()) {
+                        skipped++;
+                        continue;
+                    }
+
+                    UUID uuid = UUID.fromString(uuidRaw);
+                    boolean premium = result.getBoolean("premium");
+                    long createdAt = result.getLong("created_at");
+                    long lastLoginAt = result.getLong("last_login_at");
+                    if (result.wasNull()) {
+                        lastLoginAt = 0L;
+                    }
+                    String lastLoginIp = result.getString("last_login_ip");
+                    if (createdAt <= 0L) {
+                        createdAt = System.currentTimeMillis();
+                    }
+
+                    User sourceUser = new User(uuid, name, password, premium, createdAt, lastLoginAt, lastLoginIp);
+                    UserDAO.ImportWriteOutcome outcome = userDAO.upsertImportedUser(sourceUser);
+                    if (outcome == UserDAO.ImportWriteOutcome.SKIPPED) {
+                        skipped++;
+                    } else {
+                        imported++;
+                    }
+                } catch (IllegalArgumentException exception) {
+                    skipped++;
+                } catch (RuntimeException exception) {
+                    failed++;
+                    logWarn("DB", "Import row failed index=" + scanned + " error=" + safeMessage(exception));
+                }
+            }
+        } catch (SQLException exception) {
+            return new SqliteImportResult(false,
+                    "Import failed while reading sqlite source: " + safeMessage(exception),
+                    preview.resolvedPath(),
+                    scanned,
+                    imported,
+                    skipped,
+                    failed + 1);
+        }
+
+        onlineUserCache.clear();
+        return new SqliteImportResult(true, "completed", preview.resolvedPath(), scanned, imported, skipped, failed);
+    }
+
     private OperationResult verifyIpReputation(String playerName, String currentIp, UUID preLoginUuid) {
         if (!configManager.isIpIntelligenceEnabled() || !configManager.isIpIntelligenceCheckOnPreLogin()) {
             return new OperationResult(true, "");
@@ -1418,16 +1697,16 @@ public final class AuthService {
 
     private void logVerificationMode() {
         if (configManager.isPremiumVerificationStrict()) {
-            plugin.getLogger().info("Premium verification mode: strict (fail-closed).");
+            logInfo("SECURITY", "Premium verification mode=strict strategy=fail_closed");
             if (!canTrustPremiumIdentity()) {
-                plugin.getLogger().warning("Offline-mode without trusted proxy identity: strict premium checks can deny joins by design.");
+                logWarn("SECURITY", "Offline-mode without trusted proxy identity: strict checks may deny joins by design.");
             } else if (!Bukkit.getOnlineMode()) {
-                plugin.getLogger().warning("Strict mode with trusted proxy identity enabled. Keep backend reachable only by proxy.");
+                logWarn("SECURITY", "Strict mode with trusted proxy identity enabled. Keep backend reachable only by proxy.");
             }
             return;
         }
 
-        plugin.getLogger().warning("Premium verification mode: compatibility (best-effort). Spoof protection in offline-mode is weaker.");
+        logWarn("SECURITY", "Premium verification mode=compatibility strategy=best_effort spoof_protection_weaker=true");
     }
 
     private void cleanupExpiredLoginStarts(long now) {
@@ -1618,6 +1897,57 @@ public final class AuthService {
         return player.getAddress().getAddress().getHostAddress();
     }
 
+    private Optional<User> findUserForOnline(UUID playerId, String playerName) {
+        return onlineUserCache.lookup(
+                playerId,
+                playerName,
+                configManager.isOnlineUserCacheEnabled(),
+                configManager.getOnlineUserCacheTtlSeconds(),
+                configManager.getOnlineUserCacheMaxEntries(),
+                () -> userDAO.findByName(playerName)
+        );
+    }
+
+    private void cacheUser(UUID playerId, String playerName, User user) {
+        onlineUserCache.put(
+                playerId,
+                playerName,
+                user,
+                configManager.isOnlineUserCacheEnabled(),
+                configManager.getOnlineUserCacheTtlSeconds(),
+                configManager.getOnlineUserCacheMaxEntries()
+        );
+    }
+
+    private User withLastLogin(User source, String ip) {
+        return new User(
+                source.getUuid(),
+                source.getUsername(),
+                source.getPasswordHash(),
+                source.isPremium(),
+                source.getCreatedAt(),
+                System.currentTimeMillis(),
+                ip
+        );
+    }
+
+    private File resolveSourceFile(String sourcePath) {
+        if (sourcePath == null || sourcePath.isBlank()) {
+            return new File(plugin.getDataFolder(), "authmanager.sqlite");
+        }
+
+        File direct = new File(sourcePath);
+        if (direct.isAbsolute()) {
+            return direct;
+        }
+
+        File dataFolderRelative = new File(plugin.getDataFolder(), sourcePath);
+        if (dataFolderRelative.exists()) {
+            return dataFolderRelative;
+        }
+        return direct;
+    }
+
     private <T> void runAsyncTask(Supplier<T> task, Consumer<T> onSuccess, Consumer<Throwable> onError) {
         CompletableFuture.supplyAsync(task, authExecutor)
                 .whenComplete((result, throwable) -> {
@@ -1658,12 +1988,27 @@ public final class AuthService {
         callback.accept(payload);
     }
 
+    private void logInfo(String scope, String message) {
+        plugin.getLogger().info("[AUTH][" + sanitize(scope) + "] " + message);
+    }
+
+    private void logWarn(String scope, String message) {
+        plugin.getLogger().warning("[AUTH][" + sanitize(scope) + "] " + message);
+    }
+
     private void audit(String event, String playerName, UUID playerUuid, String ip, String reason) {
-        plugin.getLogger().info("AUDIT event=" + sanitize(event)
+        plugin.getLogger().info("[AUTH][AUDIT] event=" + sanitize(event)
                 + " player=" + sanitize(playerName)
                 + " uuid=" + (playerUuid == null ? "-" : playerUuid)
                 + " ip=" + sanitize(ip)
                 + " reason=" + sanitize(reason));
+    }
+
+    private String safeMessage(Throwable throwable) {
+        if (throwable == null || throwable.getMessage() == null || throwable.getMessage().isBlank()) {
+            return "unknown_error";
+        }
+        return throwable.getMessage().replace('\n', ' ').trim();
     }
 
     private String sanitize(String value) {
@@ -1706,7 +2051,22 @@ public final class AuthService {
             int authenticatedTracked,
             int pendingTracked,
             int packetIdentityTracked,
-            int rememberedSessionEntries
+            int rememberedSessionEntries,
+            long uptimeSeconds,
+            int authExecutorPoolSize,
+            int authExecutorActiveThreads,
+            int authExecutorQueuedTasks,
+            MetricsSnapshot loginMetrics,
+            MetricsSnapshot registerMetrics,
+            MetricsSnapshot preLoginMetrics,
+            DatabaseManager.DatabaseRuntimeSnapshot databaseRuntime,
+            OnlineUserCacheSnapshot onlineUserCache
+    ) {
+    }
+
+    public record DetailedStatusSnapshot(
+            AdminStatusSnapshot runtime,
+            DatabaseManager.DatabaseHealthSnapshot databaseHealth
     ) {
     }
 
@@ -1780,7 +2140,184 @@ public final class AuthService {
     ) {
     }
 
+    public record SqliteImportPreview(
+            boolean ready,
+            String note,
+            String resolvedPath,
+            int totalRows,
+            int invalidUuidRows,
+            int missingPasswordRows
+    ) {
+    }
+
+    public record SqliteImportResult(
+            boolean success,
+            String note,
+            String sourcePath,
+            int scannedRows,
+            int importedRows,
+            int skippedRows,
+            int failedRows
+    ) {
+    }
+
     private record JoinResolution(PendingAuthType pendingAuthType, boolean autoLoggedIn, String autoLoginReason) {
+    }
+
+    public record MetricsSnapshot(
+            long totalCalls,
+            long successfulCalls,
+            long failedCalls,
+            double averageMillis
+    ) {
+    }
+
+    public record OnlineUserCacheSnapshot(
+            int entries,
+            long hits,
+            long misses,
+            double hitRatePercent
+    ) {
+    }
+
+    private static final class OperationMetrics {
+        private final LongAdder totalCalls = new LongAdder();
+        private final LongAdder successfulCalls = new LongAdder();
+        private final LongAdder failedCalls = new LongAdder();
+        private final LongAdder totalDurationNanos = new LongAdder();
+
+        private void record(boolean success, long durationNanos) {
+            totalCalls.increment();
+            totalDurationNanos.add(Math.max(0L, durationNanos));
+            if (success) {
+                successfulCalls.increment();
+            } else {
+                failedCalls.increment();
+            }
+        }
+
+        private MetricsSnapshot snapshot() {
+            long total = totalCalls.sum();
+            long success = successfulCalls.sum();
+            long failed = failedCalls.sum();
+            double avgMs = total == 0L ? 0D : (totalDurationNanos.sum() / 1_000_000D) / total;
+            return new MetricsSnapshot(total, success, failed, avgMs);
+        }
+    }
+
+    private static final class OnlineUserCache {
+        private final Map<UUID, CacheEntry> byUuid = new ConcurrentHashMap<>();
+        private final Map<String, UUID> byLowerName = new ConcurrentHashMap<>();
+        private final LongAdder hits = new LongAdder();
+        private final LongAdder misses = new LongAdder();
+
+        private Optional<User> lookup(UUID playerId,
+                                      String playerName,
+                                      boolean enabled,
+                                      int ttlSeconds,
+                                      int maxEntries,
+                                      Supplier<Optional<User>> loader) {
+            if (!enabled) {
+                misses.increment();
+                return loader.get();
+            }
+
+            long now = System.currentTimeMillis();
+            CacheEntry cached = byUuid.get(playerId);
+            if (cached != null && cached.isFresh(now) && cached.name().equalsIgnoreCase(playerName)) {
+                hits.increment();
+                return cached.user();
+            }
+
+            misses.increment();
+            Optional<User> loaded = loader.get();
+            put(playerId, playerName, loaded.orElse(null), true, ttlSeconds, maxEntries);
+            return loaded;
+        }
+
+        private void put(UUID playerId,
+                         String playerName,
+                         User user,
+                         boolean enabled,
+                         int ttlSeconds,
+                         int maxEntries) {
+            if (!enabled || playerId == null || playerName == null || playerName.isBlank()) {
+                return;
+            }
+
+            long expiresAt = System.currentTimeMillis() + Math.max(1, ttlSeconds) * 1000L;
+            CacheEntry entry = new CacheEntry(playerName, Optional.ofNullable(user), expiresAt);
+            byUuid.put(playerId, entry);
+            byLowerName.put(playerName.toLowerCase(Locale.ROOT), playerId);
+            evictIfNeeded(maxEntries);
+        }
+
+        private void invalidate(UUID playerId) {
+            CacheEntry removed = byUuid.remove(playerId);
+            if (removed != null) {
+                byLowerName.remove(removed.name().toLowerCase(Locale.ROOT), playerId);
+            }
+        }
+
+        private void invalidateName(String playerName) {
+            if (playerName == null || playerName.isBlank()) {
+                return;
+            }
+            UUID uuid = byLowerName.remove(playerName.toLowerCase(Locale.ROOT));
+            if (uuid != null) {
+                byUuid.remove(uuid);
+            }
+        }
+
+        private void cleanupExpired() {
+            long now = System.currentTimeMillis();
+            byUuid.entrySet().removeIf(entry -> {
+                CacheEntry cached = entry.getValue();
+                if (cached.isFresh(now)) {
+                    return false;
+                }
+                byLowerName.remove(cached.name().toLowerCase(Locale.ROOT), entry.getKey());
+                return true;
+            });
+        }
+
+        private void clear() {
+            byUuid.clear();
+            byLowerName.clear();
+        }
+
+        private OnlineUserCacheSnapshot snapshot() {
+            long hitCount = hits.sum();
+            long missCount = misses.sum();
+            long total = hitCount + missCount;
+            double hitRate = total == 0L ? 0D : (hitCount * 100D) / total;
+            return new OnlineUserCacheSnapshot(byUuid.size(), hitCount, missCount, hitRate);
+        }
+
+        private void evictIfNeeded(int maxEntries) {
+            int bound = Math.max(64, maxEntries);
+            if (byUuid.size() <= bound) {
+                return;
+            }
+
+            cleanupExpired();
+            if (byUuid.size() <= bound) {
+                return;
+            }
+
+            Iterator<Map.Entry<UUID, CacheEntry>> iterator = byUuid.entrySet().iterator();
+            while (byUuid.size() > bound && iterator.hasNext()) {
+                Map.Entry<UUID, CacheEntry> entry = iterator.next();
+                iterator.remove();
+                byLowerName.remove(entry.getValue().name().toLowerCase(Locale.ROOT), entry.getKey());
+            }
+        }
+
+        private record CacheEntry(String name, Optional<User> user, long expiresAtMillis) {
+            private boolean isFresh(long now) {
+                return now <= expiresAtMillis;
+            }
+        }
     }
 
     private static final class AuthWorkerThreadFactory implements ThreadFactory {

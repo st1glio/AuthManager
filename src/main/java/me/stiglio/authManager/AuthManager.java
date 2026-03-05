@@ -10,7 +10,6 @@ import me.stiglio.authManager.commands.ChangePasswordCommand;
 import me.stiglio.authManager.commands.AuthAdminCommand;
 import me.stiglio.authManager.commands.LogoutCommand;
 import me.stiglio.authManager.commands.AuthStatusCommand;
-import me.stiglio.authManager.commands.LookupCommand;
 import me.stiglio.authManager.config.ConfigManager;
 import me.stiglio.authManager.database.DatabaseManager;
 import me.stiglio.authManager.database.UserDAO;
@@ -69,9 +68,9 @@ public final class AuthManager extends JavaPlugin {
         Bukkit.getPluginManager().registerEvents(new AuthBukkitListener(this, authService, configManager), this);
 
         if (PacketEvents.getAPI() == null) {
-            getLogger().warning("PacketEvents API non disponibile: continuo in modalita Bukkit-only.");
+            getLogger().warning("[BOOT] PacketEvents API unavailable. Running in Bukkit-only restriction mode.");
         } else if (!PacketEvents.getAPI().isInitialized()) {
-            getLogger().warning("PacketEvents API non inizializzata: continuo in modalita Bukkit-only.");
+            getLogger().warning("[BOOT] PacketEvents API not initialized. Running in Bukkit-only restriction mode.");
         } else {
             packetListener = PacketEvents.getAPI().getEventManager().registerListener(new AuthPacketListener(this, authService));
         }
@@ -82,9 +81,9 @@ public final class AuthManager extends JavaPlugin {
 
         authService.startReminderTask();
         if (packetListener != null) {
-            getLogger().info("AuthManager enabled with PacketEvents integration.");
+            getLogger().info("[BOOT] AuthManager enabled. Packet-level restrictions active.");
         } else {
-            getLogger().info("AuthManager enabled in Bukkit-only restriction mode.");
+            getLogger().info("[BOOT] AuthManager enabled. Bukkit-only restrictions active.");
         }
     }
 
@@ -116,10 +115,9 @@ public final class AuthManager extends JavaPlugin {
         PluginCommand logout = getCommand("logout");
         PluginCommand authAdmin = getCommand("authadmin");
         PluginCommand authStatus = getCommand("authstatus");
-        PluginCommand lookup = getCommand("lookup");
 
         if (login == null || register == null || premium == null || unpremium == null
-                || changePassword == null || logout == null || authAdmin == null || authStatus == null || lookup == null) {
+                || changePassword == null || logout == null || authAdmin == null || authStatus == null) {
             throw new IllegalStateException("Commands are not declared correctly in plugin.yml");
         }
 
@@ -130,9 +128,6 @@ public final class AuthManager extends JavaPlugin {
         changePassword.setExecutor(new ChangePasswordCommand(authService, configManager));
         logout.setExecutor(new LogoutCommand(authService, configManager));
         authStatus.setExecutor(new AuthStatusCommand(authService, configManager));
-        LookupCommand lookupExecutor = new LookupCommand(authService, configManager);
-        lookup.setExecutor(lookupExecutor);
-        lookup.setTabCompleter(lookupExecutor);
         AuthAdminCommand adminExecutor = new AuthAdminCommand(this, authService, configManager);
         authAdmin.setExecutor(adminExecutor);
         authAdmin.setTabCompleter(adminExecutor);

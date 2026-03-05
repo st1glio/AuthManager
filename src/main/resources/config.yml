@@ -1,4 +1,44 @@
-# SQLite database filename inside the plugin folder.
+# Database backend configuration.
+database:
+  # Supported values: sqlite, mysql, postgresql
+  type: sqlite
+  sqlite:
+    # SQLite filename inside the plugin folder.
+    file: authmanager.sqlite
+  mysql:
+    host: 127.0.0.1
+    port: 3306
+    name: authmanager
+    username: root
+    password: ""
+    ssl: false
+  postgresql:
+    host: 127.0.0.1
+    port: 5432
+    name: authmanager
+    username: postgres
+    password: ""
+    ssl: false
+  pool:
+    # Max simultaneous DB connections.
+    maximum-size: 10
+    # Min idle connections kept ready.
+    minimum-idle: 2
+    # Max wait time for a DB connection.
+    connection-timeout-millis: 10000
+    # Idle connection lifetime.
+    idle-timeout-millis: 600000
+    # Maximum single connection lifetime.
+    max-lifetime-millis: 1800000
+  # SQL statement timeout in seconds.
+  query-timeout-seconds: 5
+  retry:
+    # Max attempts for retryable DB errors (includes first try).
+    max-attempts: 3
+    # Delay before retry, multiplied by attempt number.
+    backoff-millis: 125
+
+# Legacy sqlite key (optional fallback for older configs).
 database-file: authmanager.sqlite
 # Minimum password length required for register/change-password.
 min-password-length: 6
@@ -28,6 +68,13 @@ language: it
 auth:
   # Cooldown (ms) between repeated blocked-action feedback messages.
   blocked-message-cooldown-ms: 1500
+  online-user-cache:
+    # Cache short-lived online account lookups.
+    enabled: true
+    # Cache entry lifetime in seconds.
+    ttl-seconds: 20
+    # Max cache entries before eviction.
+    max-entries: 2048
   # Commands allowed before authentication (labels and aliases).
   allowed-commands-while-unauthed:
     - login
