@@ -21,12 +21,15 @@ import me.stiglio.authManager.mojang.MojangClient;
 import me.stiglio.authManager.service.AuthService;
 import me.stiglio.authManager.service.IpIntelligenceClient;
 import me.stiglio.authManager.service.OperationResult;
+import org.bstats.bukkit.Metrics;
 import org.bukkit.Bukkit;
 import org.bukkit.command.PluginCommand;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 
 public final class AuthManager extends JavaPlugin {
+    private static final int BSTATS_PLUGIN_ID = 29932;
+
     private ConfigManager configManager;
     private DatabaseManager databaseManager;
     private AuthService authService;
@@ -38,6 +41,8 @@ public final class AuthManager extends JavaPlugin {
 
         configManager = new ConfigManager(this);
         configManager.reload();
+
+        new Metrics(this, BSTATS_PLUGIN_ID);
 
         databaseManager = new DatabaseManager(this, configManager);
         databaseManager.connect();
