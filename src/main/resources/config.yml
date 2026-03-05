@@ -1,0 +1,137 @@
+# SQLite database filename inside the plugin folder.
+database-file: authmanager.sqlite
+# Minimum password length required for register/change-password.
+min-password-length: 6
+# Auto-authenticate premium users after successful premium verification.
+auto-login-premium: true
+# Seconds between login/register reminder messages.
+auth-reminder-seconds: 6
+# Seconds allowed to authenticate before the player is kicked.
+auth-timeout-seconds: 40
+# Block chat messages until the player is authenticated.
+block-chat-while-unauthed: true
+# Block movement until the player is authenticated.
+block-movement-while-unauthed: true
+# Protect premium usernames from offline impersonation.
+enforce-premium-name-protection: true
+# Premium verification strategy: strict or compatibility.
+premium-verification-mode: compatibility
+# Trust premium identity forwarded by a trusted proxy in offline-mode.
+trusted-proxy-premium-identity: false
+# Number of async worker threads used by auth tasks.
+auth-executor-threads: 2
+# Active language for plugin messages.
+# Available languages: it, en
+# Message files: messages_it.yml / messages_en.yml
+language: it
+
+auth:
+  # Cooldown (ms) between repeated blocked-action feedback messages.
+  blocked-message-cooldown-ms: 1500
+  # Commands allowed before authentication (labels and aliases).
+  allowed-commands-while-unauthed:
+    - login
+    - register
+    - authstatus
+    - l
+    - reg
+    - astatus
+
+session:
+  remember:
+    # Keep a temporary remembered session after successful login.
+    enabled: false
+    # Remembered session duration in minutes.
+    duration-minutes: 30
+    # Allow remembered session only when IP matches.
+    require-same-ip: true
+
+security:
+  # Disable plugin startup if critical security checks fail.
+  startup-fail-fast: true
+  ip-intelligence:
+    # Enable external IP reputation checks.
+    enabled: true
+    # Perform IP checks during pre-login.
+    check-on-pre-login: true
+    # Skip local/private addresses (LAN, loopback, etc.).
+    skip-private-ip: true
+    # Allow login when IP provider is unavailable.
+    fail-open: true
+    # Deny IPs flagged as proxy.
+    deny-proxy: true
+    # Deny IPs flagged as hosting/datacenter.
+    deny-hosting: true
+    # Deny IPs flagged as mobile networks.
+    deny-mobile: false
+    # Deny if geolocation is unknown.
+    deny-unknown: false
+    # HTTP timeout for IP lookups in milliseconds.
+    request-timeout-millis: 2500
+    # Cache lifetime for IP lookup results in minutes.
+    cache-minutes: 20
+    # Optional ipinfo token to enrich IP data.
+    ipinfo-token: ""
+  account-lock:
+    # Enable account lock after repeated failed auth attempts.
+    enabled: true
+    # Time window for counting failures.
+    window-seconds: 600
+    # Maximum failed attempts allowed in the window.
+    max-failures: 6
+    # Lock duration after threshold is reached.
+    lock-seconds: 180
+  multi-account:
+    # Limit account creation per IP.
+    enabled: true
+    # Maximum accounts allowed from the same IP.
+    max-accounts-per-ip: 1
+  password:
+    # Maximum password length accepted by the plugin.
+    max-length: 64
+    # Require at least one uppercase character.
+    require-uppercase: false
+    # Require at least one lowercase character.
+    require-lowercase: false
+    # Require at least one digit.
+    require-digit: true
+    # Require at least one non-alphanumeric character.
+    require-special: false
+    # Reject passwords containing the username.
+    disallow-username: true
+    # Deny common/weak passwords.
+    blocked-list:
+      - password
+      - 123456
+      - qwerty
+      - password123
+      - admin123
+
+rate-limit:
+  # Enable anti-bruteforce rate limiting.
+  enabled: true
+  # Shared rolling window for rate-limit tracking.
+  window-seconds: 180
+  pre-login:
+    # Enable connection throttling before full login.
+    enabled: true
+    # Max attempts allowed before cooldown.
+    max-attempts: 12
+    # Initial cooldown duration after threshold hit.
+    base-cooldown-seconds: 2
+    # Maximum cooldown duration after repeated abuse.
+    max-cooldown-seconds: 25
+  login:
+    # Max failed /login attempts before cooldown.
+    max-attempts: 3
+    # Initial cooldown duration for login abuse.
+    base-cooldown-seconds: 4
+    # Maximum cooldown duration for login abuse.
+    max-cooldown-seconds: 60
+  register:
+    # Max failed /register attempts before cooldown.
+    max-attempts: 4
+    # Initial cooldown duration for register abuse.
+    base-cooldown-seconds: 6
+    # Maximum cooldown duration for register abuse.
+    max-cooldown-seconds: 90
